@@ -21,6 +21,10 @@ import (
 	"fmt"
 	"math/rand"
 
+	"k8s.io/apimachinery/pkg/util/wait"
+
+	"k8s.io/client-go/util/retry"
+
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	. "github.com/onsi/ginkgo"
@@ -265,6 +269,296 @@ var _ = Describe("Controllerutil", func() {
 			Expect(err).To(HaveOccurred())
 		})
 	})
+
+	Context("tryUpdate", func() {
+		var deploy *appsv1.Deployment
+		var deplKey types.NamespacedName
+		BeforeEach(func() {
+			deploy = &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      fmt.Sprintf("deploy-%d", rand.Int31()),
+					Namespace: "default",
+				},
+				Spec: appsv1.DeploymentSpec{
+					Selector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{"foo": "bar"},
+					},
+					Template: corev1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: map[string]string{
+								"foo": "bar",
+							},
+						},
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{
+								{
+									Name:  "busybox",
+									Image: "busybox",
+								},
+							},
+						},
+					},
+				},
+			}
+
+			deplKey = types.NamespacedName{
+				Name:      deploy.Name,
+				Namespace: deploy.Namespace,
+			}
+		})
+
+		Describe("TryUpdate", func() {
+			var specr controllerutil.MutateFn
+			var updateSpec appsv1.DeploymentSpec
+			var specCollisioner controllerutil.MutateFn
+
+			BeforeEach(func() {
+				updateSpec = appsv1.DeploymentSpec{
+					Selector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{"foo": "bar"},
+					},
+					Template: corev1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: map[string]string{
+								"foo": "bar",
+							},
+						},
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{
+								{
+									Name:  "busybox",
+									Image: "busybox",
+								},
+							},
+						},
+					},
+				}
+
+				specr = deploymentSpecr(deploy, updateSpec)
+
+				specCollisioner = func() error {
+					collision := deploy.DeepCopy()
+					collision.SetAnnotations(map[string]string{"collision": ""})
+					return c.Update(context.TODO(), collision)
+				}
+			})
+
+			It("should successfully update the object", func() {
+				By("creating the object")
+				Expect(c.Create(context.TODO(), deploy)).To(Succeed())
+
+				By("updating the object")
+				op, err := controllerutil.TryUpdate(context.TODO(), retry.DefaultBackoff, c, deploy, specr)
+
+				By("returning no error")
+				Expect(err).NotTo(HaveOccurred())
+
+				By("returning TryUpdateResultUpdated")
+				Expect(op).To(BeEquivalentTo(controllerutil.TryUpdateResultUpdated))
+
+				By("actually having the deployment updated")
+				fetched := &appsv1.Deployment{}
+				Expect(c.Get(context.TODO(), deplKey, fetched)).To(Succeed())
+
+				By("being mutated by MutateFn")
+				Expect(fetched.Spec.Template.Spec.Containers).To(HaveLen(1))
+				Expect(fetched.Spec.Template.Spec.Containers[0].Name).To(Equal(updateSpec.Template.Spec.Containers[0].Name))
+				Expect(fetched.Spec.Template.Spec.Containers[0].Image).To(Equal(updateSpec.Template.Spec.Containers[0].Image))
+			})
+
+			It("should update the object after a collision", func() {
+				By("creating the object")
+				Expect(c.Create(context.TODO(), deploy)).To(Succeed())
+
+				By("updating the object")
+				first := true
+				op, err := controllerutil.TryUpdate(context.TODO(), retry.DefaultBackoff, c, deploy, func() error {
+					if first {
+						By("causing a collision")
+						first = false
+						Expect(specCollisioner()).To(Succeed())
+					}
+					return specr()
+				})
+
+				By("returning no error")
+				Expect(err).NotTo(HaveOccurred())
+
+				By("returning TryUpdateResultUpdated")
+				Expect(op).To(BeEquivalentTo(controllerutil.TryUpdateResultUpdated))
+
+				By("actually having the deployment updated")
+				fetched := &appsv1.Deployment{}
+				Expect(c.Get(context.TODO(), deplKey, fetched)).To(Succeed())
+
+				By("being mutated by MutateFn")
+				Expect(fetched.Spec.Template.Spec.Containers).To(HaveLen(1))
+				Expect(fetched.Spec.Template.Spec.Containers[0].Name).To(Equal(updateSpec.Template.Spec.Containers[0].Name))
+				Expect(fetched.Spec.Template.Spec.Containers[0].Image).To(Equal(updateSpec.Template.Spec.Containers[0].Image))
+			})
+
+			It("stops trying to update the object after too many collisions", func() {
+				By("creating the object")
+				Expect(c.Create(context.TODO(), deploy)).To(Succeed())
+
+				By("updating the object")
+				first := true
+				backoff := wait.Backoff{Steps: 1}
+				op, err := controllerutil.TryUpdate(context.TODO(), backoff, c, deploy, func() error {
+					if first {
+						By("causing a collision")
+						first = false
+						Expect(specCollisioner()).To(Succeed())
+					}
+					return specr()
+				})
+
+				By("returning a timeout error")
+				Expect(err).To(HaveOccurred())
+				Expect(err).To(Equal(wait.ErrWaitTimeout))
+
+				By("returning TryUpdateResultNone")
+				Expect(op).To(BeEquivalentTo(controllerutil.TryUpdateResultNone))
+			})
+		})
+
+		Describe("TryUpdateStatus", func() {
+			var updateStatus appsv1.DeploymentStatus
+			var statusr controllerutil.MutateFn
+			var statusCollisioner controllerutil.MutateFn
+
+			BeforeEach(func() {
+				updateStatus = appsv1.DeploymentStatus{
+					Replicas: 2,
+				}
+
+				deplKey = types.NamespacedName{
+					Name:      deploy.Name,
+					Namespace: deploy.Namespace,
+				}
+
+				statusr = deploymentStatusr(deploy, updateStatus)
+
+				statusCollisioner = func() error {
+					collision := deploy.DeepCopy()
+					collision.Status.Replicas = 5
+					return c.Status().Update(context.TODO(), collision)
+				}
+			})
+
+			It("should successfully update the object", func() {
+				By("creating the object")
+				Expect(c.Create(context.TODO(), deploy)).To(Succeed())
+
+				By("updating the object")
+				op, err := controllerutil.TryUpdateStatus(context.TODO(), retry.DefaultBackoff, c, deploy, statusr)
+
+				By("returning no error")
+				Expect(err).NotTo(HaveOccurred())
+
+				By("returning TryUpdateResultUpdated")
+				Expect(op).To(BeEquivalentTo(controllerutil.TryUpdateResultUpdated))
+
+				By("actually having the deployment updated")
+				fetched := &appsv1.Deployment{}
+				Expect(c.Get(context.TODO(), deplKey, fetched)).To(Succeed())
+
+				By("being mutated by MutateFn")
+				Expect(fetched.Status.Replicas).To(Equal(updateStatus.Replicas))
+			})
+
+			It("should update the object after a collision", func() {
+				By("creating the object")
+				Expect(c.Create(context.TODO(), deploy)).To(Succeed())
+
+				By("updating the object")
+				first := true
+				op, err := controllerutil.TryUpdateStatus(context.TODO(), retry.DefaultBackoff, c, deploy, func() error {
+					if first {
+						By("causing a collision")
+						first = false
+						Expect(statusCollisioner()).To(Succeed())
+					}
+					return statusr()
+				})
+
+				By("returning no error")
+				Expect(err).NotTo(HaveOccurred())
+
+				By("returning TryUpdateResultUpdated")
+				Expect(op).To(BeEquivalentTo(controllerutil.TryUpdateResultUpdated))
+
+				By("actually having the deployment updated")
+				fetched := &appsv1.Deployment{}
+				Expect(c.Get(context.TODO(), deplKey, fetched)).To(Succeed())
+
+				By("being mutated by MutateFn")
+				Expect(fetched.Status.Replicas).To(Equal(updateStatus.Replicas))
+			})
+
+			It("stops trying to update the object after too many collisions", func() {
+				By("creating the object")
+				Expect(c.Create(context.TODO(), deploy)).To(Succeed())
+
+				By("updating the object")
+				first := true
+				backoff := wait.Backoff{Steps: 1}
+				op, err := controllerutil.TryUpdateStatus(context.TODO(), backoff, c, deploy, func() error {
+					if first {
+						By("causing a collision")
+						first = false
+						Expect(statusCollisioner()).To(Succeed())
+					}
+					return statusr()
+				})
+
+				By("returning a timeout error")
+				Expect(err).To(HaveOccurred())
+				Expect(err).To(Equal(wait.ErrWaitTimeout))
+
+				By("returning TryUpdateResultNone")
+				Expect(op).To(BeEquivalentTo(controllerutil.TryUpdateResultNone))
+			})
+		})
+	})
+
+	Describe("DeleteIfExists", func() {
+		var cm *corev1.ConfigMap
+
+		BeforeEach(func() {
+			cm = &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      fmt.Sprintf("cm-%d", rand.Int31()),
+					Namespace: corev1.NamespaceDefault,
+				},
+			}
+		})
+
+		It("should delete the object if it exists", func() {
+			By("creating the object")
+			Expect(c.Create(context.TODO(), cm)).To(Succeed())
+
+			By("deleting the existing object")
+			op, err := controllerutil.DeleteIfExists(context.TODO(), c, cm)
+
+			By("returning no error")
+			Expect(err).NotTo(HaveOccurred())
+
+			By("returning DeleteIfExistsResultDeleted")
+			Expect(op).To(Equal(controllerutil.DeleteIfExistsResultDeleted))
+		})
+
+		It("should do nothing if the object does not exist", func() {
+			By("deleting the non-existing object")
+			op, err := controllerutil.DeleteIfExists(context.TODO(), c, cm)
+
+			By("returning no error")
+			Expect(err).NotTo(HaveOccurred())
+
+			By("returning DeleteIfExistsResultNone")
+			Expect(op).To(Equal(controllerutil.DeleteIfExistsResultNone))
+		})
+	})
 })
 
 var _ metav1.Object = &errMetaObj{}
@@ -276,6 +570,13 @@ type errMetaObj struct {
 func deploymentSpecr(deploy *appsv1.Deployment, spec appsv1.DeploymentSpec) controllerutil.MutateFn {
 	return func() error {
 		deploy.Spec = spec
+		return nil
+	}
+}
+
+func deploymentStatusr(deploy *appsv1.Deployment, status appsv1.DeploymentStatus) controllerutil.MutateFn {
+	return func() error {
+		deploy.Status = status
 		return nil
 	}
 }

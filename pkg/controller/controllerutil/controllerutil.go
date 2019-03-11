@@ -20,8 +20,11 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"time"
 
-	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/util/wait"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -102,58 +105,20 @@ func referSameObject(a, b metav1.OwnerReference) bool {
 	return aGV == bGV && a.Kind == b.Kind && a.Name == b.Name
 }
 
-// OperationResult is the action result of a CreateOrUpdate call
+// OperationResult is the result of a utility operation.
+// They should complete the sentence "Deployment default/foo has been ..."
 type OperationResult string
 
-const ( // They should complete the sentence "Deployment default/foo has been ..."
+const (
 	// OperationResultNone means that the resource has not been changed
 	OperationResultNone OperationResult = "unchanged"
 	// OperationResultCreated means that a new resource is created
 	OperationResultCreated OperationResult = "created"
 	// OperationResultUpdated means that an existing resource is updated
 	OperationResultUpdated OperationResult = "updated"
+	// OperationResultDeleted means that an existing resource is deleted
+	OperationResultDeleted OperationResult = "deleted"
 )
-
-// CreateOrUpdate creates or updates the given object in the Kubernetes
-// cluster. The object's desired state must be reconciled with the existing
-// state inside the passed in callback MutateFn.
-//
-// The MutateFn is called regardless of creating or updating an object.
-//
-// It returns the executed operation and an error.
-func CreateOrUpdate(ctx context.Context, c client.Client, obj runtime.Object, f MutateFn) (OperationResult, error) {
-	key, err := client.ObjectKeyFromObject(obj)
-	if err != nil {
-		return OperationResultNone, err
-	}
-
-	if err := c.Get(ctx, key, obj); err != nil {
-		if !errors.IsNotFound(err) {
-			return OperationResultNone, err
-		}
-		if err := mutate(f, key, obj); err != nil {
-			return OperationResultNone, err
-		}
-		if err := c.Create(ctx, obj); err != nil {
-			return OperationResultNone, err
-		}
-		return OperationResultCreated, nil
-	}
-
-	existing := obj.DeepCopyObject()
-	if err := mutate(f, key, obj); err != nil {
-		return OperationResultNone, err
-	}
-
-	if reflect.DeepEqual(existing, obj) {
-		return OperationResultNone, nil
-	}
-
-	if err := c.Update(ctx, obj); err != nil {
-		return OperationResultNone, err
-	}
-	return OperationResultUpdated, nil
-}
 
 // mutate wraps a MutateFn and applies validation to its result
 func mutate(f MutateFn, key client.ObjectKey, obj runtime.Object) error {
@@ -168,3 +133,198 @@ func mutate(f MutateFn, key client.ObjectKey, obj runtime.Object) error {
 
 // MutateFn is a function which mutates the existing object into it's desired state.
 type MutateFn func() error
+
+// CreateOrUpdateResult is the action result of a CreateOrUpdate call
+type CreateOrUpdateResult OperationResult
+
+const (
+	// CreateOrUpdateResultNone means that the resource has not been changed
+	CreateOrUpdateResultNone = CreateOrUpdateResult(OperationResultNone)
+	// CreateOrUpdateResultCreated means that a new resource is created
+	CreateOrUpdateResultCreated = CreateOrUpdateResult(OperationResultCreated)
+	// CreateOrUpdateResultUpdated means that an existing resource is updated
+	CreateOrUpdateResultUpdated = CreateOrUpdateResult(OperationResultUpdated)
+)
+
+// CreateOrUpdate creates or updates the given object in the Kubernetes
+// cluster. The object's desired state must be reconciled with the existing
+// state inside the passed in callback MutateFn.
+//
+// The MutateFn is called regardless of creating or updating an object.
+//
+// It returns the executed operation and an error.
+func CreateOrUpdate(ctx context.Context, c client.Client, obj runtime.Object, f MutateFn) (CreateOrUpdateResult, error) {
+	key, err := client.ObjectKeyFromObject(obj)
+	if err != nil {
+		return CreateOrUpdateResultNone, err
+	}
+
+	if err := c.Get(ctx, key, obj); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return CreateOrUpdateResultNone, err
+		}
+		if err := mutate(f, key, obj); err != nil {
+			return CreateOrUpdateResultNone, err
+		}
+		if err := c.Create(ctx, obj); err != nil {
+			return CreateOrUpdateResultNone, err
+		}
+		return CreateOrUpdateResultCreated, nil
+	}
+
+	existing := obj.DeepCopyObject()
+	if err := mutate(f, key, obj); err != nil {
+		return CreateOrUpdateResultNone, err
+	}
+
+	if reflect.DeepEqual(existing, obj) {
+		return CreateOrUpdateResultNone, nil
+	}
+
+	if err := c.Update(ctx, obj); err != nil {
+		return CreateOrUpdateResultNone, err
+	}
+	return CreateOrUpdateResultUpdated, nil
+}
+
+// TryUpdateResult is the action result of a TryUpdate or TryUpdateStatus call.
+type TryUpdateResult OperationResult
+
+const (
+	// TryUpdateResultNone means that the resource has not been changed
+	TryUpdateResultNone = TryUpdateResult(OperationResultNone)
+	// TryUpdateResultUpdated means that an existing resource is updated
+	TryUpdateResultUpdated = TryUpdateResult(OperationResultUpdated)
+)
+
+// TryUpdate updates the given object in the Kubernetes
+// cluster. The object's desired state must be reconciled with the existing
+// state inside the passed in callback MutateFn. If there was a conflict, the given backoff
+// will be applied to determine whether and when to retry.
+//
+// The MutateFn is always called.
+//
+// It returns the executed operation and an error.
+func TryUpdate(ctx context.Context, backoff wait.Backoff, c client.Client, obj runtime.Object, f MutateFn) (TryUpdateResult, error) {
+	return tryUpdate(ctx, backoff, c, obj, c.Update, f)
+}
+
+// TryUpdateStatus updates the status of the given object in the Kubernetes
+// cluster. The object's desired status must be reconciled with the existing
+// state inside the passed in callback MutateFn. If there was a conflict, the given backoff
+// will be applied to determine whether and when to retry.
+//
+// The MutateFn is always called.
+//
+// It returns the executed operation and an error.
+func TryUpdateStatus(ctx context.Context, backoff wait.Backoff, c client.Client, obj runtime.Object, f MutateFn) (TryUpdateResult, error) {
+	return tryUpdate(ctx, backoff, c, obj, c.Status().Update, f)
+}
+
+func sleepBackoff(ctx context.Context, duration time.Duration) error {
+	if duration == 0 {
+		return ctx.Err()
+	}
+
+	timer := time.NewTicker(duration)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func exponentialBackoff(ctx context.Context, backoff wait.Backoff, condition wait.ConditionFunc) error {
+	duration := backoff.Duration
+
+	for i := 0; i < backoff.Steps; i++ {
+		if ok, err := condition(); err != nil || ok {
+			return err
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			adjusted := duration
+			if backoff.Jitter > 0.0 {
+				adjusted = wait.Jitter(duration, backoff.Jitter)
+			}
+
+			if err := sleepBackoff(ctx, adjusted); err != nil {
+				return err
+			}
+			duration = time.Duration(float64(duration) * backoff.Factor)
+		}
+	}
+
+	return wait.ErrWaitTimeout
+}
+
+func tryUpdate(
+	ctx context.Context,
+	backoff wait.Backoff,
+	c client.Client,
+	obj runtime.Object,
+	updateFunc func(context.Context, runtime.Object) error,
+	f MutateFn,
+) (TryUpdateResult, error) {
+	key, err := client.ObjectKeyFromObject(obj)
+	if err != nil {
+		return TryUpdateResultNone, err
+	}
+
+	result := TryUpdateResultNone
+	err = exponentialBackoff(ctx, backoff, func() (bool, error) {
+		if err := c.Get(ctx, key, obj); err != nil {
+			return false, err
+		}
+
+		beforeTransform := obj.DeepCopyObject()
+		if err := mutate(f, key, obj); err != nil {
+			return false, err
+		}
+
+		if reflect.DeepEqual(obj, beforeTransform) {
+			return true, nil
+		}
+
+		if err := updateFunc(ctx, obj); err != nil {
+			if apierrors.IsConflict(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		result = TryUpdateResultUpdated
+		return true, nil
+	})
+	return result, err
+}
+
+// DeleteIfExistsResult is the action result of a DeleteIfExists call.
+type DeleteIfExistsResult = OperationResult
+
+const (
+	// DeleteIfExistsResultNone means that the resource has not been changed
+	DeleteIfExistsResultNone = DeleteIfExistsResult(OperationResultNone)
+
+	// DeleteIfExistsResultDeleted means that the resource has been deleted
+	DeleteIfExistsResultDeleted = DeleteIfExistsResult(OperationResultDeleted)
+)
+
+// DeleteIfExists deletes the given object in the Kubernetes
+// cluster if it exists.
+//
+// It returns the executed operation and an error.
+func DeleteIfExists(ctx context.Context, c client.Client, obj runtime.Object, opts ...client.DeleteOptionFunc) (DeleteIfExistsResult, error) {
+	if err := c.Delete(ctx, obj, opts...); err != nil {
+		if apierrors.IsNotFound(err) {
+			return DeleteIfExistsResultNone, nil
+		}
+		return DeleteIfExistsResultNone, err
+	}
+	return DeleteIfExistsResultDeleted, nil
+}
